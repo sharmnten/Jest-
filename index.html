@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Quiplash</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/appwrite@8.5.0"></script>
+</head>
+<body>
+  <!-- Login / Lobby -->
+  <div id="login">
+    <h2>Join or Create Game</h2>
+    <input type="text" id="playerName" placeholder="Enter your name">
+    <button id="createGame">Create Game</button>
+    <input type="text" id="gameCode" placeholder="Game code">
+    <button id="joinGame">Join Game</button>
+  </div>
+
+  <div id="lobby" style="display:none">
+    <h2>Lobby</h2>
+    <p>Game Code: <span id="lobbyCode"></span></p>
+    <ul id="playerList"></ul>
+    <button id="submitPromptsBtn">Submit Prompts</button>
+  </div>
+
+  <!-- Prompt Submission -->
+  <div id="submitPrompts" style="display:none">
+    <h2>Submit Your Prompts</h2>
+    <input type="text" id="customPromptInput" placeholder="Write a funny prompt">
+    <button id="addPrompt">Add Prompt</button>
+    <ul id="promptList"></ul>
+    <button id="startGame">Start Game</button>
+  </div>
+
+  <!-- Prompt Display -->
+  <div id="prompt" style="display:none">
+    <h2>Write your answer!</h2>
+    <p id="promptText"></p>
+    <input type="text" id="answerInput" placeholder="Type your answer">
+    <button id="submitAnswer">Submit</button>
+
+    <!-- Prompt Timer -->
+    <div id="promptTimer" class="timer-container">
+      <div id="promptProgress" class="timer-bar"></div>
+    </div>
+  </div>
+
+  <!-- Voting -->
+  <div id="voting" style="display:none">
+    <h2>Vote for the Funniest!</h2>
+    <div id="voteOptions"></div>
+
+    <!-- Voting Timer -->
+    <div id="votingTimer" class="timer-container">
+      <div id="votingProgress" class="timer-bar"></div>
+    </div>
+  </div>
+
+  <!-- Leaderboard -->
+  <div id="leaderboard" style="display:none">
+    <h2>Leaderboard</h2>
+    <ul id="scoreList"></ul>
+    <button id="nextRoundBtn">Next Round</button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
