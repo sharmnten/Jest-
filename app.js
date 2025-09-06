@@ -1,11 +1,11 @@
-import { Client, Account, Database } from 'appwrite';
 
-const client = new Client()
-  .setEndpoint('https://nyc.cloud.appwrite.io/v1')
-  .setProject('jest');
 
-const account = new Account(client);
-const database = new Database(client);
+const client = new Appwrite.Client()
+client.setEndpoint('https://nyc.cloud.appwrite.io/v1')
+client.setProject('jest');
+
+const account = new Appwrite.Account(client);
+const database = new Appwrite.Databases(client);
 
 let currentUser = null;
 let currentGame = null;
