@@ -1,0 +1,27 @@
+{
+  "name": "jest-quiplash-game",
+  "version": "1.0.0",
+  "description": "A multiplayer party game similar to Quiplash, built with vanilla JavaScript and Appwrite",
+  "main": "app.js",
+  "scripts": {
+    "start": "npx http-server -p 8080 -c-1 --cors",
+    "dev": "npx http-server -p 8080 -c-1 --cors -o",
+    "serve": "python3 -m http.server 8080"
+  },
+  "keywords": [
+    "game",
+    "multiplayer",
+    "quiplash",
+    "party-game",
+    "appwrite"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

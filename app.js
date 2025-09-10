@@ -1,8 +1,29 @@
 
 
+// Load configuration
+const config = window.CONFIG || {
+  APPWRITE_ENDPOINT: 'https://nyc.cloud.appwrite.io/v1',
+  APPWRITE_PROJECT_ID: 'jest',
+  DATABASE_ID: 'jestblank_db',
+  COLLECTIONS: {
+    GAMES: 'games',
+    PROMPTS: 'prompts',
+    ANSWERS: 'answers'
+  },
+  GAME_SETTINGS: {
+    MIN_PLAYERS: 2,
+    MAX_PLAYERS: 8,
+    PROMPT_TIMER_SECONDS: 30,
+    VOTING_TIMER_SECONDS: 20,
+    ROUNDS_PER_GAME: 5
+  },
+  DEBUG_MODE: false,
+  SHOW_DEBUG_BUTTON: false
+};
+
 const client = new Appwrite.Client();
-client.setEndpoint('https://nyc.cloud.appwrite.io/v1');
-client.setProject('jest');
+client.setEndpoint(config.APPWRITE_ENDPOINT);
+client.setProject(config.APPWRITE_PROJECT_ID);
 
 const account = new Appwrite.Account(client);
 const database = new Appwrite.Databases(client);
@@ -12,6 +33,11 @@ let currentGame = null;
 let currentPrompt = null;
 let currentAnswers = [];
 let round = 1;
+let activeSubscriptions = [];  // Track all active subscriptions for cleanup
+let answerSubscription = null;  // Track answer subscription separately for cleanup
+let voteSubscription = null;  // Track vote subscription separately for cleanup  
+let hasVoted = false;  // Track if current user has voted this round
+let isVotingPhase = false;  // Prevent race conditions in voting phase
 
 // Utility: dedupe players array by player id (prefix before ':')
 function dedupePlayers(players) {
@@ -74,22 +100,43 @@ document.getElementById('registerBtn').addEventListener('click', async function(
   const password = document.getElementById('registerPassword').value;
   if (!name || !email || !password) return alert('Please fill all fields.');
   if (password.length < 8) return alert('Password must be at least 8 characters.');
+  
   try {
+    // Register the user
     await registerUser(email, password, name);
-    // Wait a moment for registration to propagate
-    setTimeout(async () => {
+    
+    // Attempt login with retry logic
+    let loginAttempts = 0;
+    const maxAttempts = 3;
+    
+    const attemptLogin = async () => {
       try {
         await loginUser(email, password);
         document.getElementById('registerForm').style.display = 'none';
         document.getElementById('gameOptions').style.display = 'block';
         document.getElementById('globalPrompt').style.display = 'block';
+        return true;
       } catch (err) {
-        alert('Registered, but login failed. Please try logging in.');
-        document.getElementById('registerForm').style.display = 'none';
-        document.getElementById('loginForm').style.display = 'block';
+        loginAttempts++;
+        if (loginAttempts < maxAttempts) {
+          // Wait and retry
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          return attemptLogin();
+        }
+        return false;
       }
-    }, 500);
+    };
+    
+    const success = await attemptLogin();
+    if (!success) {
+      alert('Registration successful! Please log in manually.');
+      document.getElementById('registerForm').style.display = 'none';
+      document.getElementById('loginForm').style.display = 'block';
+      // Pre-fill the email for convenience
+      document.getElementById('loginEmail').value = email;
+    }
   } catch (err) {
+    console.error('Registration error:', err);
     alert(err.message || 'Registration failed.');
   }
 });
@@ -99,66 +146,93 @@ document.getElementById('loginBtn').addEventListener('click', async function() {
   const email = document.getElementById('loginEmail').value.trim();
   const password = document.getElementById('loginPassword').value;
   if (!email || !password) return alert('Please fill all fields.');
+  
+  // Disable button during login
+  const loginBtn = document.getElementById('loginBtn');
+  const originalText = loginBtn.innerText;
+  loginBtn.innerText = 'Logging in...';
+  loginBtn.disabled = true;
+  
   try {
     await loginUser(email, password);
-  document.getElementById('loginForm').style.display = 'none';
-  document.getElementById('gameOptions').style.display = 'block';
-  document.getElementById('globalPrompt').style.display = 'block';
+    document.getElementById('loginForm').style.display = 'none';
+    document.getElementById('gameOptions').style.display = 'block';
+    document.getElementById('globalPrompt').style.display = 'block';
   } catch (err) {
     alert(err.message || 'Login failed.');
+  } finally {
+    loginBtn.innerText = originalText;
+    loginBtn.disabled = false;
   }
 });
 async function registerUser(email, password, name) {
   try {
-    await account.create('unique()', email, password, name);
+    const result = await account.create('unique()', email, password, name);
+    return result;
   } catch (error) {
-    if (error.code !== 409) throw error; // 409: user already exists
+    console.error('Registration error:', error);
+    if (error.code === 409) {
+      throw new Error('User with this email already exists.');
+    }
+    throw error;
   }
 }
 
 async function loginUser(email, password) {
-  // Clean up games with no players and status 'waiting' so codes can be reused
   try {
-    const games = await database.listDocuments('jestblank_db', 'games', [Appwrite.Query.equal('status', 'waiting')]);
-    for (const game of games.documents) {
-      if (!game.players || game.players.length === 0) {
-        await database.deleteDocument('jestblank_db', 'games', game.$id);
-      }
+    // First, try to delete any existing session
+    try {
+      await account.deleteSession('current');
+    } catch (err) {
+      // Ignore if no session exists
     }
-  } catch (err) {
-    // Ignore errors, just a cleanup
-  }
-  try {
-    // Try to get existing session
-    const user = await account.get();
-    currentUser = { name: user.name || user.email, id: user.$id };
-  } catch (err) {
-    // If no session, create one
+    
+    // Create new session
     await account.createEmailPasswordSession(email, password);
     const user = await account.get();
     currentUser = { name: user.name || user.email, id: user.$id };
+    
+    // Clean up orphaned games after successful login
+    cleanupOrphanedGames();
+  } catch (err) {
+    console.error('Login error:', err);
+    throw new Error('Login failed. Please check your credentials.');
   }
+}
 
-  // After login, clean up orphaned games
+async function cleanupOrphanedGames() {
   try {
-    const games = await database.listDocuments('jestblank_db', 'games', [Appwrite.Query.equal('status', 'in-progress')]);
-    for (const game of games.documents) {
+    // Clean up games with no players and status 'waiting' so codes can be reused
+    const waitingGames = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.GAMES, 
+      [Appwrite.Query.equal('status', 'waiting')]);
+    for (const game of waitingGames.documents) {
       if (!game.players || game.players.length === 0) {
-  await safeUpdateDocument('jestblank_db', 'games', game.$id, { status: 'waiting' });
+        await database.deleteDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, game.$id);
+      }
+    }
+    
+    // Update in-progress games with no players
+    const activeGames = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.GAMES, 
+      [Appwrite.Query.equal('status', 'in-progress')]);
+    for (const game of activeGames.documents) {
+      if (!game.players || game.players.length === 0) {
+        await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, game.$id, { status: 'waiting' });
       }
       // Backfill hostId for legacy games
       if (game.players && game.players.length > 0 && !game.hostId) {
         const hostId = game.players[0].split(":")[0];
         try {
-          await safeUpdateDocument('jestblank_db', 'games', game.$id, { hostId });
+          await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, game.$id, { hostId });
         } catch (e) {
           // ignore
         }
       }
     }
   } catch (err) {
-    // Ignore errors, just a cleanup
+    console.error('Cleanup error:', err);
+    // Don't throw - this is just cleanup
   }
+
 }
 
 // Render player list helper (global)
@@ -183,7 +257,7 @@ function renderPlayerList(game) {
 async function createGame() {
   const gameCode = Math.random().toString(36).substring(2, 6).toUpperCase();
   currentGame = await safeCreateDocument(
-    'jestblank_db',    // databaseId
+    config.DATABASE_ID,    // databaseId
     'games',           // collectionId
     'unique()',        // documentId
     {
@@ -206,7 +280,7 @@ async function createGame() {
 async function joinGame() {
   const code = document.getElementById('gameCode').value.toUpperCase();
   const gameList = await database.listDocuments(
-    'jestblank_db', 
+    config.DATABASE_ID, 
     'games',
     [Appwrite.Query.equal('code', code)]
   );
@@ -221,7 +295,7 @@ async function joinGame() {
     currentGame.players.push(entry);
     const deduped = dedupePlayers(currentGame.players);
     await safeUpdateDocument(
-      'jestblank_db',
+      config.DATABASE_ID,
       'games',
       currentGame.$id,
       { players: deduped }
@@ -239,24 +313,55 @@ async function joinGame() {
 
 // --- Lobby Subscription ---
 function subscribeLobby() {
+  // Clean up any existing subscriptions before creating new ones
+  cleanupSubscriptions();
+  
   const playerList = document.getElementById('playerList');
+  
+  // Initialize button state based on whether current user is host
+  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  const startButton = document.getElementById('startGame');
+  
+  // Set initial button state
+  if (startButton) {
+    const submitted = currentGame.submittedPrompts || [];
+    const allPromptsSubmitted = submitted.length === currentGame.players.length;
+    
+    if (allPromptsSubmitted) {
+      startButton.disabled = !isHost;
+      startButton.innerText = isHost ? "Start Game" : "Waiting for host...";
+    } else {
+      startButton.disabled = true;
+      startButton.innerText = "Waiting for prompts...";
+    }
+    
+    console.log('subscribeLobby: initial button state', {
+      isHost,
+      allPromptsSubmitted,
+      disabled: startButton.disabled,
+      text: startButton.innerText
+    });
+  }
   // Ensure a debug button exists in lobby for quick inspection
-  const lobbyEl = document.getElementById('lobby');
-  if (lobbyEl && !document.getElementById('debugShowState')) {
-    const dbg = document.createElement('button');
-    dbg.id = 'debugShowState';
-    dbg.innerText = 'DEBUG: Show Game State';
-    dbg.style.background = '#f39c12';
-    dbg.style.marginTop = '1rem';
-    dbg.onclick = () => {
-      console.log('DEBUG currentGame', currentGame);
-      alert('currentGame:\n' + JSON.stringify(currentGame, null, 2));
-    };
-    lobbyEl.appendChild(dbg);
+  if (config.SHOW_DEBUG_BUTTON || config.DEBUG_MODE) {
+    const lobbyEl = document.getElementById('lobby');
+    if (lobbyEl && !document.getElementById('debugShowState')) {
+      const dbg = document.createElement('button');
+      dbg.id = 'debugShowState';
+      dbg.innerText = 'DEBUG: Show Game State';
+      dbg.style.background = '#f39c12';
+      dbg.style.marginTop = '1rem';
+      dbg.onclick = () => {
+        console.log('DEBUG currentGame', currentGame);
+        alert('currentGame:\n' + JSON.stringify(currentGame, null, 2));
+      };
+      lobbyEl.appendChild(dbg);
+    }
   }
 
-  client.subscribe(`databases.jestblank_db.documents.${currentGame.$id}`, response => {
-    if (response.events.includes('database.documents.update')) {
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.GAMES}.documents.${currentGame.$id}`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
       currentGame = response.payload;
       // Update host label
       const hostId = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
@@ -273,7 +378,7 @@ function subscribeLobby() {
       // If no players, set game status to 'waiting'
       if (!currentGame.players || currentGame.players.length === 0) {
         if (currentGame.status !== 'waiting') {
-            safeUpdateDocument('jestblank_db', 'games', currentGame.$id, { status: 'waiting' }).catch(()=>{});
+            safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { status: 'waiting' }).catch(()=>{});
         }
         return;
       }
@@ -283,18 +388,30 @@ function subscribeLobby() {
         showPrompt();
       } else if (currentGame.submittedPrompts && currentGame.submittedPrompts.length === currentGame.players.length) {
         // Enable start button only for host when all prompts are submitted
-  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
-  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
-        console.log('subscribeLobby: all prompts submitted', { submittedCount: currentGame.submittedPrompts.length, playersCount: currentGame.players.length, isHost });
+        const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+        const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+        console.log('subscribeLobby: all prompts submitted', { 
+          submittedCount: currentGame.submittedPrompts.length, 
+          playersCount: currentGame.players.length, 
+          isHost,
+          currentUserId: currentUser?.id,
+          hostId: hostCandidate
+        });
         document.getElementById('startGame').disabled = !isHost;
         document.getElementById('startGame').innerText = isHost ? "Start Game" : "Waiting for host...";
       } else {
-        console.log('subscribeLobby: waiting for prompts', { submitted: currentGame.submittedPrompts, players: currentGame.players });
+        console.log('subscribeLobby: waiting for prompts', { 
+          submitted: currentGame.submittedPrompts?.length || 0, 
+          players: currentGame.players?.length || 0,
+          submittedList: currentGame.submittedPrompts,
+          playersList: currentGame.players
+        });
         document.getElementById('startGame').disabled = true;
         document.getElementById('startGame').innerText = "Waiting for prompts...";
       }
     }
   });
+  activeSubscriptions.push(subscription);
 }
 
 // --- Prompt Submission ---
@@ -304,11 +421,22 @@ function showPromptSubmission() {
 }
 
 async function addPrompt() {
-  const text = document.getElementById('customPromptInput').value.trim();
+  const input = document.getElementById('customPromptInput');
+  if (!input) {
+    console.error('customPromptInput element not found');
+    return;
+  }
+  
+  const text = input.value.trim();
   if (!text) return alert("Type a prompt!");
+  
+  // Validate prompt length
+  if (text.length > 500) {
+    return alert("Prompt is too long! Maximum 500 characters.");
+  }
   const promptDoc = await safeCreateDocument(
-    'jestblank_db',
-    'prompts',
+    config.DATABASE_ID,
+    config.COLLECTIONS.PROMPTS,
     'unique()',
     { text, submittedBy: currentUser.id, gameId: currentGame.$id }
   );
@@ -324,20 +452,31 @@ async function addPrompt() {
   let submitted = currentGame.submittedPrompts || [];
   if (!submitted.includes(currentUser.id)) {
     submitted.push(currentUser.id);
-  await safeUpdateDocument('jestblank_db', 'games', currentGame.$id, { submittedPrompts: submitted });
-  // Update local cache so UI immediately reflects submission
-  currentGame.submittedPrompts = submitted;
+    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { submittedPrompts: submitted });
+    // Update local cache so UI immediately reflects submission
+    currentGame.submittedPrompts = submitted;
+    console.log('addPrompt: updated submittedPrompts', { 
+      submittedPrompts: submitted,
+      playersCount: currentGame.players?.length || 0,
+      allPromptsSubmitted: submitted.length === currentGame.players?.length
+    });
   }
 }
 
 // --- Start Game ---
 async function startGame() {
-  console.log('startGame invoked', { currentUser, currentGame });
-  // Ensure we have a currentGame; try to load if missing
+  console.log('startGame invoked', { 
+    currentUser, 
+    currentGame,
+    buttonDisabled: document.getElementById('startGame').disabled,
+    buttonText: document.getElementById('startGame').innerText
+  });
+  
+  // Input validation
   if (!currentGame) {
     try {
       const code = document.getElementById('lobbyCode').innerText;
-      const list = await database.listDocuments('jestblank_db', 'games', [Appwrite.Query.equal('code', code)]);
+      const list = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.GAMES, [Appwrite.Query.equal('code', code)]);
       if (!list.documents.length) return alert('Game not found.');
       currentGame = list.documents[0];
     } catch (err) {
@@ -347,7 +486,7 @@ async function startGame() {
   }
   // Refresh currentGame from server to get up-to-date submittedPrompts/players
   try {
-    const fresh = await database.getDocument('jestblank_db', 'games', currentGame.$id);
+    const fresh = await database.getDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id);
     currentGame = fresh;
     console.log('startGame: refreshed currentGame from server', currentGame);
   } catch (err) {
@@ -356,23 +495,43 @@ async function startGame() {
   // Only host can start the game
   const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
   const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  console.log('startGame: checking host status', {
+    isHost,
+    currentUserId: currentUser?.id,
+    hostId: hostCandidate,
+    players: currentGame.players
+  });
   if (!isHost) {
-    console.log('startGame blocked: not host', { isHost, currentUser, currentGame });
+    console.log('startGame blocked: not host');
     return alert("Only the host can start the game.");
   }
+  
+  // Check minimum players
+  if (currentGame.players.length < config.GAME_SETTINGS.MIN_PLAYERS) {
+    return alert(`Need at least ${config.GAME_SETTINGS.MIN_PLAYERS} players to start the game.`);
+  }
+  
+  // Check maximum players
+  if (currentGame.players.length > config.GAME_SETTINGS.MAX_PLAYERS) {
+    return alert(`Too many players! Maximum is ${config.GAME_SETTINGS.MAX_PLAYERS}.`);
+  }
+  
   // Ensure all players have submitted prompts
   const submitted = currentGame.submittedPrompts || [];
   if (submitted.length < currentGame.players.length) {
     console.log('startGame blocked: not enough submitted prompts', { submittedLength: submitted.length, playersLength: currentGame.players.length });
     return alert("All players must submit a prompt before starting the game.");
   }
-  // Only use prompts for this game
-  const prompts = await database.listDocuments('jestblank_db', 'prompts', [Appwrite.Query.equal('gameId', currentGame.$id)]);
-  if (prompts.total < currentGame.players.length) return alert("Need more prompts!");
+  // Only use prompts for this specific game
+  const prompts = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.PROMPTS, 
+    [Appwrite.Query.equal('gameId', currentGame.$id)]);
+  if (prompts.total < 1) {
+    return alert("No prompts available! Each player must submit at least one prompt.");
+  }
   currentPrompt = prompts.documents[Math.floor(Math.random() * prompts.total)].text;
   try {
     await safeUpdateDocument(
-      'jestblank_db',
+      config.DATABASE_ID,
       'games',
       currentGame.$id,
       { status: 'in-progress', currentPrompt }
@@ -385,8 +544,8 @@ async function startGame() {
   // Dev helper: expose a force-start for testing (bypasses gating) on window
   window.forceStartGame = async function() {
     try {
-      const fresh = await database.getDocument('jestblank_db', 'games', currentGame.$id);
-      await safeUpdateDocument('jestblank_db', 'games', fresh.$id, { status: 'in-progress' });
+      const fresh = await database.getDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id);
+      await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, fresh.$id, { status: 'in-progress' });
       alert('Force-started game.');
     } catch (e) {
       console.error('forceStartGame failed', e);
@@ -400,19 +559,60 @@ async function startGame() {
 
 // --- Show Prompt & Answer ---
 function showPrompt() {
-  document.getElementById('prompt').classList.remove('fade-out');
-  document.getElementById('prompt').style.display = 'block';
-  document.getElementById('prompt').classList.add('fade-in');
+  const promptDiv = document.getElementById('prompt');
   const promptText = document.getElementById('promptText');
+  const answerInput = document.getElementById('answerInput');
+  
+  // Null checks
+  if (!promptDiv || !promptText || !answerInput) {
+    console.error('Required prompt elements not found');
+    return;
+  }
+  
+  // Reset state for new round
+  currentAnswers = [];
+  isVotingPhase = false;
+  hasVoted = false;
+  
+  // Hide voting div if still visible
+  const votingDiv = document.getElementById('voting');
+  if (votingDiv) {
+    votingDiv.style.display = 'none';
+  }
+  
+  // Clear any existing timers
+  if (promptTimerInterval) {
+    clearInterval(promptTimerInterval);
+    promptTimerInterval = null;
+  }
+  if (votingTimerInterval) {
+    clearInterval(votingTimerInterval);
+    votingTimerInterval = null;
+  }
+  
+  promptDiv.classList.remove('fade-out');
+  promptDiv.style.display = 'block';
+  promptDiv.classList.add('fade-in');
+  
   // Always use the prompt from the game document
-  promptText.innerText = currentGame.currentPrompt;
+  promptText.innerText = currentGame.currentPrompt || 'No prompt available';
   promptText.classList.add('slide-in');
-  startPromptTimer(30);
+  
+  // Clear previous answer
+  answerInput.value = '';
+  
+  startPromptTimer(config.GAME_SETTINGS.PROMPT_TIMER_SECONDS);
   subscribeAnswers();
 }
 
 // --- Prompt Timer ---
 function startPromptTimer(seconds) {
+  // Clear any existing timer first
+  if (promptTimerInterval) {
+    clearInterval(promptTimerInterval);
+    promptTimerInterval = null;
+  }
+  
   const timerDiv = document.getElementById('promptTimer');
   const progress = document.getElementById('promptProgress');
   timerDiv.style.display = 'block';
@@ -432,74 +632,122 @@ function startPromptTimer(seconds) {
 
 // --- Submit Answer ---
 async function submitAnswer() {
-  let answerText = document.getElementById('answerInput').value.trim();
+  const answerInput = document.getElementById('answerInput');
+  if (!answerInput) {
+    console.error('answerInput element not found');
+    return;
+  }
+  
+  let answerText = answerInput.value.trim();
   if (!answerText) answerText = "(No answer)";
-  await safeCreateDocument(
-    'jestblank_db',
-    'answers',
-    'unique()',
-    {
-      gameId: currentGame.$id,
-      playerId: currentUser.id,
-      promptText: answerText,
-      votes: 0
-    }
-  );
-  document.getElementById('prompt').classList.add('fade-out');
-  setTimeout(() => {
-    document.getElementById('prompt').style.display = 'none';
-  }, 300);
+  
+  // Validate answer length
+  if (answerText.length > 500) {
+    alert('Answer is too long! Maximum 500 characters.');
+    return;
+  }
+  
+  try {
+    await safeCreateDocument(
+      config.DATABASE_ID,
+      'answers',
+      'unique()',
+      {
+        gameId: currentGame.$id,
+        playerId: currentUser.id,
+        promptText: answerText,
+        votes: 0
+      }
+    );
+    document.getElementById('prompt').classList.add('fade-out');
+    setTimeout(() => {
+      document.getElementById('prompt').style.display = 'none';
+    }, 300);
+  } catch (err) {
+    console.error('Failed to submit answer:', err);
+    alert('Failed to submit answer. Please try again.');
+  }
 }
 
 // --- Answers Subscription ---
 function subscribeAnswers() {
+  // Clean up any existing answer subscriptions first
+  cleanupAnswerSubscriptions();
+  
   currentAnswers = [];
-  client.subscribe(`databases.jestblank_db.documents`, response => {
-    if (response.events.includes('database.documents.create')) {
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.create')) {
       const doc = response.payload;
       if (doc.gameId === currentGame.$id) currentAnswers.push(doc);
-      // Only start voting when all answers are submitted
-      if (currentAnswers.length === currentGame.players.length) startVoting();
+      // Only start voting when all answers are submitted and not already in voting phase
+      if (!isVotingPhase && currentAnswers.length === currentGame.players.length) {
+        isVotingPhase = true;
+        startVoting();
+      }
     }
   });
+  answerSubscription = subscription;
 }
 
 // --- Start Voting ---
 function startVoting() {
+  // Prevent multiple calls
+  if (document.getElementById('voting').style.display === 'block') return;
+  
   document.getElementById('voting').classList.remove('fade-out');
   document.getElementById('voting').style.display = 'block';
   document.getElementById('voting').classList.add('fade-in');
-  startVotingTimer(20);
+  startVotingTimer(config.GAME_SETTINGS.VOTING_TIMER_SECONDS);
   const container = document.getElementById('voteOptions');
   container.innerHTML = '';
-  const allAnswers = [...currentAnswers];
-  allAnswers.push({
-    playerId: currentUser.id,
-    promptText: document.getElementById('answerInput').value,
-    $id: 'self'
-  });
+  
+  // Filter out current user's answer if already in the list to prevent duplicates
+  const filteredAnswers = currentAnswers.filter(a => a.playerId !== currentUser.id);
+  const allAnswers = [...filteredAnswers];
+  
+  // Add current user's answer (either from input or from subscription)
+  const userAnswer = currentAnswers.find(a => a.playerId === currentUser.id);
+  if (userAnswer) {
+    allAnswers.push(userAnswer);
+  } else {
+    allAnswers.push({
+      playerId: currentUser.id,
+      promptText: document.getElementById('answerInput').value || '(No answer)',
+      $id: 'self'
+    });
+  }
+  
   const shuffled = allAnswers.sort(() => Math.random() - 0.5);
   for (let i = 0; i < shuffled.length; i += 2) {
     const a = shuffled[i];
     let b = shuffled[i + 1];
-    if (!b) b = { playerId: 'dummy', promptText: 'Randomly skipped' };
+    if (!b) b = { playerId: 'dummy', promptText: 'Randomly skipped', $id: 'dummy' };
     const btnA = document.createElement('button');
     btnA.innerText = a.promptText;
+    btnA.dataset.answerId = a.$id;
     btnA.classList.add('fade-in');
-    btnA.onclick = () => vote(a.$id);
+    btnA.onclick = () => vote(a.$id, a.playerId);
     const btnB = document.createElement('button');
     btnB.innerText = b.promptText;
+    btnB.dataset.answerId = b.$id;
     btnB.classList.add('fade-in');
-    btnB.onclick = () => vote(b.$id);
+    btnB.onclick = () => vote(b.$id, b.playerId);
     container.appendChild(btnA);
     container.appendChild(btnB);
     container.appendChild(document.createElement('hr'));
   }
+  hasVoted = false;
   subscribeVotes();
 }
 
 // --- Voting Timer ---
 function startVotingTimer(seconds) {
+  // Clear any existing timer first
+  if (votingTimerInterval) {
+    clearInterval(votingTimerInterval);
+    votingTimerInterval = null;
+  }
+  
   const timerDiv = document.getElementById('votingTimer');
   const progress = document.getElementById('votingProgress');
   timerDiv.style.display = 'block';
@@ -519,15 +767,34 @@ function startVotingTimer(seconds) {
 }
 
 // --- Vote ---
-async function vote(answerId) {
+async function vote(answerId, playerId) {
+  // Prevent self-voting and multiple votes
   if (answerId === 'self' || answerId === 'dummy') return;
-  const answer = await database.getDocument('jestblank_db', 'answers', answerId);
-  await safeUpdateDocument(
-    'jestblank_db',
-    'answers',
-    answerId,
-    { votes: answer.votes + 1 }
-  );
+  if (playerId === currentUser.id) {
+    alert("You can't vote for your own answer!");
+    return;
+  }
+  if (hasVoted) {
+    alert("You've already voted this round!");
+    return;
+  }
+  hasVoted = true;
+  
+  try {
+    const answer = await database.getDocument(config.DATABASE_ID, config.COLLECTIONS.ANSWERS, answerId);
+    await safeUpdateDocument(
+      config.DATABASE_ID,
+      'answers',
+      answerId,
+      { votes: answer.votes + 1 }
+    );
+  } catch (err) {
+    console.error('Failed to record vote:', err);
+    hasVoted = false;  // Allow retry on error
+    alert('Failed to record vote. Please try again.');
+    return;
+  }
+  
   document.getElementById('voting').classList.add('fade-out');
   setTimeout(() => {
     document.getElementById('voting').style.display = 'none';
@@ -538,7 +805,7 @@ async function vote(answerId) {
 // --- Leaderboard ---
 async function showLeaderboard() {
   const answers = await database.listDocuments(
-    'jestblank_db',
+    config.DATABASE_ID,
     'answers',
     [Appwrite.Query.equal('gameId', currentGame.$id)]
   );
@@ -565,13 +832,144 @@ async function showLeaderboard() {
 // --- Next Round ---
 async function nextRound() {
   round++;
-  const prompts = await database.listDocuments('jestblank_db', 'prompts');
-  currentPrompt = prompts.documents[Math.floor(Math.random() * prompts.total)].text;
-  document.getElementById('leaderboard').classList.add('fade-out');
-  setTimeout(() => {
-    document.getElementById('leaderboard').style.display = 'none';
-    showPrompt();
-  }, 300);
+  isVotingPhase = false;  // Reset voting phase flag
+  hasVoted = false;  // Reset vote tracking
+  
+  // Check if game has reached max rounds
+  if (round > config.GAME_SETTINGS.ROUNDS_PER_GAME) {
+    showFinalResults();
+    return;
+  }
+  
+  try {
+    // Get prompts for this specific game only
+    const prompts = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.PROMPTS,
+      [Appwrite.Query.equal('gameId', currentGame.$id)]);
+    
+    if (prompts.documents.length === 0) {
+      alert('No more prompts available for this game!');
+      showFinalResults();
+      return;
+    }
+    
+    // Pick a random prompt that hasn't been used yet
+    const unusedPrompts = prompts.documents.filter(p => p.text !== currentGame.currentPrompt);
+    if (unusedPrompts.length === 0) {
+      alert('All prompts have been used!');
+      showFinalResults();
+      return;
+    }
+    
+    currentPrompt = unusedPrompts[Math.floor(Math.random() * unusedPrompts.length)].text;
+    
+    // Update game with new prompt
+    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, 
+      { currentPrompt });
+  } catch (err) {
+    console.error('Failed to get next round prompt:', err);
+    alert('Failed to start next round. Please try again.');
+    return;
+  }
+  const leaderboardDiv = document.getElementById('leaderboard');
+  if (leaderboardDiv) {
+    leaderboardDiv.classList.add('fade-out');
+    setTimeout(() => {
+      leaderboardDiv.style.display = 'none';
+      // Ensure prompt div is hidden before showing new prompt
+      const promptDiv = document.getElementById('prompt');
+      if (promptDiv) {
+        promptDiv.style.display = 'none';
+        promptDiv.classList.remove('fade-in', 'fade-out');
+      }
+      // Small delay to ensure clean transition
+      setTimeout(() => {
+        showPrompt();
+      }, 100);
+    }, 300);
+  }
+}
+
+// --- Show Final Results ---
+function showFinalResults() {
+  const leaderboardDiv = document.getElementById('leaderboard');
+  const nextRoundBtn = document.getElementById('nextRoundBtn');
+  
+  if (leaderboardDiv) {
+    const h2 = leaderboardDiv.querySelector('h2');
+    if (h2) h2.innerText = 'Final Results!';
+  }
+  
+  if (nextRoundBtn) {
+    nextRoundBtn.innerText = 'New Game';
+    nextRoundBtn.onclick = () => {
+      // Reset game state and go back to lobby
+      cleanupSubscriptions();
+      currentGame = null;
+      currentAnswers = [];
+      round = 1;
+      isVotingPhase = false;
+      hasVoted = false;
+      window.location.reload();
+    };
+  }
+}
+
+// --- Subscribe to Votes ---
+function subscribeVotes() {
+  // Subscribe to vote updates on answers for current game
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
+      const doc = response.payload;
+      // Check if this is an answer document for our game
+      if (doc.gameId === currentGame.$id && doc.votes !== undefined) {
+        // Update the vote count in UI if voting is still active
+        const voteButtons = document.querySelectorAll('#voteOptions button');
+        voteButtons.forEach(btn => {
+          // Update button text if it matches this answer
+          if (btn.dataset && btn.dataset.answerId === doc.$id) {
+            const voteCount = doc.votes > 0 ? ` (${doc.votes} votes)` : '';
+            btn.innerText = doc.promptText + voteCount;
+          }
+        });
+      }
+    }
+  });
+  voteSubscription = subscription;
+}
+
+// --- Cleanup Subscriptions ---
+function cleanupSubscriptions() {
+  activeSubscriptions.forEach(sub => {
+    try {
+      if (sub && typeof sub === 'function') {
+        sub();  // Appwrite subscriptions return an unsubscribe function
+      }
+    } catch (err) {
+      console.error('Error cleaning up subscription:', err);
+    }
+  });
+  activeSubscriptions = [];
+  cleanupAnswerSubscriptions();
+}
+
+// --- Cleanup Answer/Vote Subscriptions ---
+function cleanupAnswerSubscriptions() {
+  if (answerSubscription && typeof answerSubscription === 'function') {
+    try {
+      answerSubscription();
+    } catch (err) {
+      console.error('Error cleaning up answer subscription:', err);
+    }
+    answerSubscription = null;
+  }
+  if (voteSubscription && typeof voteSubscription === 'function') {
+    try {
+      voteSubscription();
+    } catch (err) {
+      console.error('Error cleaning up vote subscription:', err);
+    }
+    voteSubscription = null;
+  }
 }
 
 // --- Event Listeners ---
@@ -590,29 +988,73 @@ document.getElementById('showRegister').addEventListener('click', function(e) {
 document.getElementById('createGame').addEventListener('click', createGame);
 document.getElementById('joinGame').addEventListener('click', joinGame);
 document.getElementById('addPrompt').addEventListener('click', addPrompt);
-document.getElementById('startGame').addEventListener('click', startGame);
+document.getElementById('startGame').addEventListener('click', function(e) {
+  console.log('Start Game button clicked', {
+    disabled: e.target.disabled,
+    text: e.target.innerText
+  });
+  if (!e.target.disabled) {
+    startGame();
+  }
+});
 document.getElementById('submitAnswer').addEventListener('click', submitAnswer);
 document.getElementById('nextRoundBtn').addEventListener('click', nextRound);
 
+// --- Cleanup on page unload ---
+window.addEventListener('beforeunload', () => {
+  cleanupSubscriptions();
+  // Clear timers
+  if (promptTimerInterval) clearInterval(promptTimerInterval);
+  if (votingTimerInterval) clearInterval(votingTimerInterval);
+});
+
+// --- Auto-check session on load ---
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const user = await account.get();
+    if (user) {
+      currentUser = { name: user.name || user.email, id: user.$id };
+      document.getElementById('registerForm').style.display = 'none';
+      document.getElementById('loginForm').style.display = 'none';
+      document.getElementById('gameOptions').style.display = 'block';
+      document.getElementById('globalPrompt').style.display = 'block';
+    }
+  } catch (err) {
+    // No session, show login/register
+    console.log('No active session');
+  }
+});
+
 // --- Global Prompt Submission ---
 document.getElementById('globalAddPrompt').addEventListener('click', async function() {
-  const text = document.getElementById('globalPromptInput').value.trim();
+  const input = document.getElementById('globalPromptInput');
+  if (!input) return;
+  
+  const text = input.value.trim();
   if (!text) return alert('Type a prompt!');
+  
+  // Validate length
+  if (text.length > 500) {
+    return alert('Prompt is too long! Maximum 500 characters.');
+  }
+  
   try {
-    // Submit to the crowd pool (no gameId)
+    // Submit to the global pool (no gameId - this is for future games)
     await safeCreateDocument(
-      'jestblank_db',
-      'prompts',
+      config.DATABASE_ID,
+      config.COLLECTIONS.PROMPTS,
       'unique()',
-      { text, submittedBy: currentUser ? currentUser.id : 'anon' }
+      { text, submittedBy: currentUser ? currentUser.id : 'anon', gameId: 'global' }
     );
     // Add to the visible list
     const ul = document.getElementById('globalPromptList');
-    const li = document.createElement('li');
-    li.innerText = text;
-    li.classList.add('fade-in');
-    ul.appendChild(li);
-    document.getElementById('globalPromptInput').value = '';
+    if (ul) {
+      const li = document.createElement('li');
+      li.innerText = text;
+      li.classList.add('fade-in');
+      ul.appendChild(li);
+    }
+    input.value = '';
   } catch (err) {
     alert('Failed to submit prompt.');
   }
