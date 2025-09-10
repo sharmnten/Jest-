@@ -14,7 +14,7 @@
   <input type="text" id="registerName" class="input" placeholder="Enter your name">
   <input type="email" id="registerEmail" class="input" placeholder="Enter your email">
   <input type="password" id="registerPassword" class="input" placeholder="Enter your password">
-  <button id="registerBtn" class="primary-btn">Register</button>
+  <button id="registerBtn" class="btn-accent-purple">Register</button>
   <p>Already have an account? <a href="#" id="showLogin">Login</a></p>
   </div>
 
@@ -23,37 +23,38 @@
   <h2>Login</h2>
   <input type="email" id="loginEmail" class="input" placeholder="Enter your email">
   <input type="password" id="loginPassword" class="input" placeholder="Enter your password">
-  <button id="loginBtn" class="primary-btn">Login</button>
+  <button id="loginBtn" class="btn-accent-green">Login</button>
   <p>Don't have an account? <a href="#" id="showRegister">Register</a></p>
   </div>
 
   <!-- Game Options -->
   <div id="gameOptions" style="display:none">
   <h2>Welcome!</h2>
-  <button id="createGame" class="primary-btn">Create Game</button>
+  <button id="createGame" class="btn-accent-green">Create Game</button>
   <input type="text" id="gameCode" class="input" placeholder="Game code">
-  <button id="joinGame" class="primary-btn">Join Game</button>
+  <button id="joinGame" class="btn-accent-purple">Join Game</button>
   </div>
 
   <!-- Global Prompt Submission -->
   <div id="globalPrompt" class="card" style="display:none">
     <h2>Submit a Prompt to the Crowd Pool</h2>
     <input type="text" id="globalPromptInput" placeholder="Write a funny prompt">
-    <button id="globalAddPrompt" class="primary-btn">Add Prompt</button>
+    <button id="globalAddPrompt" class="btn-accent-yellow">Add Prompt</button>
     <ul id="globalPromptList"></ul>
   </div>
 
   <div id="lobby" style="display:none">
   <h2>Lobby</h2>
+  <div id="systemMessage" style="display:none" class="card"></div>
   <p>Game Code: <span id="lobbyCode"></span></p>
-  <p id="hostLabel"></p>
+  <p id="hostLabel" class="muted"></p>
   <p id="playerCount"></p>
   <ul id="playerList" class="list"></ul>
   <h3>Submit Your Prompt</h3>
   <input type="text" id="customPromptInput" class="input" placeholder="Write a funny prompt">
-  <button id="addPrompt" class="primary-btn">Add Prompt</button>
+  <button id="addPrompt" class="btn-accent-yellow">Add Prompt</button>
   <ul id="promptList" class="list"></ul>
-  <button id="startGame" class="primary-btn">Start Game</button>
+  <button id="startGame" class="btn-accent-purple jester">Start Game</button>
   </div>
 
   <!-- Prompt Submission section removed: now part of lobby -->
@@ -63,7 +64,7 @@
   <h2>Write your answer!</h2>
   <p id="promptText"></p>
   <input type="text" id="answerInput" class="input" placeholder="Type your answer">
-  <button id="submitAnswer" class="primary-btn">Submit</button>
+  <button id="submitAnswer" class="">Submit</button>
 
     <!-- Prompt Timer -->
     <div id="promptTimer" class="timer-container">
@@ -86,7 +87,7 @@
   <div id="leaderboard" style="display:none">
   <h2>Leaderboard</h2>
   <ul id="scoreList" class="list"></ul>
-  <button id="nextRoundBtn" class="primary-btn">Next Round</button>
+  <button id="nextRoundBtn" class="btn-accent-green">Next Round</button>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/appwrite@17.0.0"></script>
   <script src="config.js"></script>

@@ -38,6 +38,57 @@ let answerSubscription = null;  // Track answer subscription separately for clea
 let voteSubscription = null;  // Track vote subscription separately for cleanup  
 let hasVoted = false;  // Track if current user has voted this round
 let isVotingPhase = false;  // Prevent race conditions in voting phase
+let votingEnded = false; // Has voting completed and leaderboard shown
+// Realtime sync monitor
+let lastRealtimeEvent = Date.now();
+let realtimeMonitorInterval = null;
+const REALTIME_HEARTBEAT_MS = 8000; // if no events in this window, try resync
+const REALTIME_POLL_INTERVAL = 5000;
+
+function recordRealtimeEvent() {
+  lastRealtimeEvent = Date.now();
+}
+
+function startRealtimeMonitor() {
+  stopRealtimeMonitor();
+  realtimeMonitorInterval = setInterval(() => {
+    const age = Date.now() - lastRealtimeEvent;
+    if (age > REALTIME_HEARTBEAT_MS) {
+      console.warn('Realtime heartbeat missed, performing resync', { age });
+      // Resync authoritative game state
+      resyncGameState().catch(err => console.error('Resync failed', err));
+    }
+  }, REALTIME_POLL_INTERVAL);
+}
+
+function stopRealtimeMonitor() {
+  if (realtimeMonitorInterval) { clearInterval(realtimeMonitorInterval); realtimeMonitorInterval = null; }
+}
+
+async function resyncGameState() {
+  if (!currentGame || !currentGame.$id) return;
+  try {
+    const fresh = await database.getDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id);
+    currentGame = fresh;
+    console.log('resyncGameState: refreshed currentGame', currentGame);
+    // Update UI to reflect authoritative state
+    renderPlayerList(currentGame);
+    // update start button state
+    const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":" )[0]);
+    const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+    const startButton = document.getElementById('startGame');
+    if (startButton) {
+      const submitted = currentGame.submittedPrompts || [];
+      const allPromptsSubmitted = submitted.length === currentGame.players.length;
+      startButton.disabled = !allPromptsSubmitted || !isHost;
+      startButton.innerText = allPromptsSubmitted ? (isHost ? 'Start Game' : 'Waiting for host...') : 'Waiting for prompts...';
+    }
+  // Keep next round button state in sync
+  updateNextRoundButtonState();
+  } catch (err) {
+    console.error('resyncGameState failed', err);
+  }
+}
 
 // Utility: dedupe players array by player id (prefix before ':')
 function dedupePlayers(players) {
@@ -271,7 +322,10 @@ async function createGame() {
   document.getElementById('gameOptions').style.display = 'none';
   document.getElementById('lobby').style.display = 'block';
   document.getElementById('lobbyCode').innerText = gameCode;
-  document.getElementById('hostLabel').innerText = `Host: ${currentUser.name}`;
+  // small inline jester hat SVG
+  const hatSvg = '<svg class="jester-hat" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M2 12c0 5.523 4.477 10 10 10s10-4.477 10-10c0-2.21-4-6-8-6s-8 3.79-8 6z" fill="#8e44ad" opacity="0.12"/><path d="M6 10c1-2 4-3 6-3s5 1 6 3-2 4-6 4-6-2-6-4z" fill="#9b59b6"/><path d="M8 9l-1.2-2.4L6 9l2 1 2-2 2 2 2-1 2 1-1.2-2.4L16 9l2 1-2 1-2-1-2 1-2-1-2 1-2-1z" fill="#f1c40f"/></svg>';
+  document.getElementById('hostLabel').innerHTML = `Host: <span class="host-badge tooltip" data-tip="You are the host">${hatSvg}${currentUser.name}</span>`;
+  const gp = document.getElementById('globalPrompt'); if (gp) gp.style.display = 'none';
   renderPlayerList(currentGame);
   subscribeLobby();
 }
@@ -307,6 +361,7 @@ async function joinGame() {
   document.getElementById('gameOptions').style.display = 'none';
   document.getElementById('lobby').style.display = 'block';
   document.getElementById('lobbyCode').innerText = code;
+  const gp = document.getElementById('globalPrompt'); if (gp) gp.style.display = 'none';
   renderPlayerList(currentGame);
   subscribeLobby();
 }
@@ -361,9 +416,11 @@ function subscribeLobby() {
   }
 
   const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.GAMES}.documents.${currentGame.$id}`], response => {
-    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
+  // record any realtime event for monitor
+  recordRealtimeEvent();
+  if (response.events.includes('databases.*.collections.*.documents.*.update')) {
       currentGame = response.payload;
-      // Update host label
+      // Update host label with styled badge
       const hostId = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
       let hostDisplay = hostId;
       if (currentGame.players) {
@@ -372,9 +429,17 @@ function subscribeLobby() {
           if (parts[0] === hostId) { hostDisplay = parts[1] || parts[0]; break; }
         }
       }
-      document.getElementById('hostLabel').innerText = `Host: ${hostDisplay}`;
+  const hostLabelEl = document.getElementById('hostLabel');
+  const hatSvg = '<svg class="jester-hat" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M2 12c0 5.523 4.477 10 10 10s10-4.477 10-10c0-2.21-4-6-8-6s-8 3.79-8 6z" fill="#8e44ad" opacity="0.12"/><path d="M6 10c1-2 4-3 6-3s5 1 6 3-2 4-6 4-6-2-6-4z" fill="#9b59b6"/><path d="M8 9l-1.2-2.4L6 9l2 1 2-2 2 2 2-1 2 1-1.2-2.4L16 9l2 1-2 1-2-1-2 1-2-1-2 1-2-1z" fill="#f1c40f"/></svg>';
+  if (hostLabelEl) hostLabelEl.innerHTML = `Host: <span class="host-badge tooltip" data-tip="You are the host">${hatSvg}${hostDisplay}</span>`;
       // Render player list and count
       renderPlayerList(currentGame);
+      // Display any system message attached to the game
+      try {
+        const sm = currentGame.lastSystemMessage;
+        const el = document.getElementById('systemMessage');
+        if (sm && el) { el.innerText = sm; el.classList.add('show'); } else if (el) { el.classList.remove('show'); el.innerText = ''; }
+      } catch (e) {}
       // If no players, set game status to 'waiting'
       if (!currentGame.players || currentGame.players.length === 0) {
         if (currentGame.status !== 'waiting') {
@@ -409,15 +474,18 @@ function subscribeLobby() {
         document.getElementById('startGame').disabled = true;
         document.getElementById('startGame').innerText = "Waiting for prompts...";
       }
+    updateNextRoundButtonState();
     }
   });
   activeSubscriptions.push(subscription);
+  // Start the realtime heartbeat monitor
+  startRealtimeMonitor();
 }
 
 // --- Prompt Submission ---
 let customPrompts = [];
 function showPromptSubmission() {
-  // No longer needed, prompt box is in lobby
+  // placeholder if we need to show a dedicated prompt UI later
 }
 
 async function addPrompt() {
@@ -426,40 +494,39 @@ async function addPrompt() {
     console.error('customPromptInput element not found');
     return;
   }
-  
+
   const text = input.value.trim();
   if (!text) return alert("Type a prompt!");
-  
-  // Validate prompt length
-  if (text.length > 500) {
-    return alert("Prompt is too long! Maximum 500 characters.");
-  }
-  const promptDoc = await safeCreateDocument(
-    config.DATABASE_ID,
-    config.COLLECTIONS.PROMPTS,
-    'unique()',
-    { text, submittedBy: currentUser.id, gameId: currentGame.$id }
-  );
-  customPrompts.push(promptDoc);
-  const ul = document.getElementById('promptList');
-  const li = document.createElement('li');
-  li.innerText = text;
-  li.classList.add('fade-in');
-  ul.appendChild(li);
-  document.getElementById('customPromptInput').value = '';
 
-  // Track submitted prompts in game document
-  let submitted = currentGame.submittedPrompts || [];
-  if (!submitted.includes(currentUser.id)) {
-    submitted.push(currentUser.id);
-    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { submittedPrompts: submitted });
-    // Update local cache so UI immediately reflects submission
-    currentGame.submittedPrompts = submitted;
-    console.log('addPrompt: updated submittedPrompts', { 
-      submittedPrompts: submitted,
-      playersCount: currentGame.players?.length || 0,
-      allPromptsSubmitted: submitted.length === currentGame.players?.length
-    });
+  if (text.length > 500) return alert('Prompt is too long! Maximum 500 characters.');
+
+  try {
+    const promptDoc = await safeCreateDocument(
+      config.DATABASE_ID,
+      config.COLLECTIONS.PROMPTS,
+      'unique()',
+      { text, submittedBy: currentUser.id, gameId: currentGame.$id }
+    );
+    customPrompts.push(promptDoc);
+    const ul = document.getElementById('promptList');
+    if (ul) {
+      const li = document.createElement('li');
+      li.innerText = text;
+      li.classList.add('fade-in');
+      ul.appendChild(li);
+    }
+    input.value = '';
+
+    // Track submitted prompts in game document
+    let submitted = currentGame.submittedPrompts || [];
+    if (!submitted.includes(currentUser.id)) {
+      submitted.push(currentUser.id);
+      await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { submittedPrompts: submitted });
+      currentGame.submittedPrompts = submitted;
+    }
+  } catch (err) {
+    console.error('addPrompt failed', err);
+    alert('Failed to add prompt. Please try again.');
   }
 }
 
@@ -552,8 +619,9 @@ async function startGame() {
       alert('Force start failed. See console.');
     }
   };
+  // ensure any legacy submitPrompts UI is hidden if present
   const submitPromptsEl = document.getElementById('submitPrompts');
-  if (submitPromptsEl) submitPromptsEl.style.display = 'none';
+  if (submitPromptsEl) submitPromptsEl.remove();
   // Host does not call showPrompt(); all users will transition via subscription
 }
 
@@ -676,6 +744,8 @@ function subscribeAnswers() {
   
   currentAnswers = [];
   const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
+    // record heartbeat
+    recordRealtimeEvent();
     if (response.events.includes('databases.*.collections.*.documents.*.create')) {
       const doc = response.payload;
       if (doc.gameId === currentGame.$id) currentAnswers.push(doc);
@@ -687,12 +757,14 @@ function subscribeAnswers() {
     }
   });
   answerSubscription = subscription;
+  startRealtimeMonitor();
 }
 
 // --- Start Voting ---
 function startVoting() {
   // Prevent multiple calls
   if (document.getElementById('voting').style.display === 'block') return;
+  votingEnded = false;
   
   document.getElementById('voting').classList.remove('fade-out');
   document.getElementById('voting').style.display = 'block';
@@ -722,13 +794,14 @@ function startVoting() {
     const a = shuffled[i];
     let b = shuffled[i + 1];
     if (!b) b = { playerId: 'dummy', promptText: 'Randomly skipped', $id: 'dummy' };
-    const btnA = document.createElement('button');
-    btnA.innerText = a.promptText;
+  const btnA = document.createElement('button');
+  // Don't show vote counts until voting has ended
+  btnA.innerText = a.promptText;
     btnA.dataset.answerId = a.$id;
     btnA.classList.add('fade-in');
     btnA.onclick = () => vote(a.$id, a.playerId);
     const btnB = document.createElement('button');
-    btnB.innerText = b.promptText;
+  btnB.innerText = b.promptText;
     btnB.dataset.answerId = b.$id;
     btnB.classList.add('fade-in');
     btnB.onclick = () => vote(b.$id, b.playerId);
@@ -761,7 +834,10 @@ function startVotingTimer(seconds) {
       clearInterval(votingTimerInterval);
       timerDiv.style.display = 'none';
       document.getElementById('voting').style.display = 'none';
-      showLeaderboard();
+  // Mark voting ended to prevent duplicate triggers and show the leaderboard
+  votingEnded = true;
+  votingTimerInterval = null;
+  showLeaderboard();
     }
   }, 1000);
 }
@@ -794,16 +870,17 @@ async function vote(answerId, playerId) {
     alert('Failed to record vote. Please try again.');
     return;
   }
-  
+  // Hide voting UI for this player; leaderboard will be shown when all votes are recorded
   document.getElementById('voting').classList.add('fade-out');
   setTimeout(() => {
     document.getElementById('voting').style.display = 'none';
-    showLeaderboard();
   }, 300);
 }
 
 // --- Leaderboard ---
 async function showLeaderboard() {
+  // Mark voting ended so vote counts may now be revealed
+  votingEnded = true;
   const answers = await database.listDocuments(
     config.DATABASE_ID,
     'answers',
@@ -827,10 +904,66 @@ async function showLeaderboard() {
   document.getElementById('leaderboard').classList.remove('fade-out');
   document.getElementById('leaderboard').style.display = 'block';
   document.getElementById('leaderboard').classList.add('fade-in');
+  // Enable next round only for host
+  updateNextRoundButtonState();
+}
+
+// Broadcast a short system message to the game by updating game doc
+async function broadcastSystemMessage(message) {
+  if (!currentGame || !currentGame.$id) return;
+  try {
+    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { lastSystemMessage: message });
+  } catch (err) {
+    console.error('broadcastSystemMessage failed', err);
+  }
+}
+
+// Enable/disable Next Round button depending on whether current user is host
+function updateNextRoundButtonState() {
+  const btn = document.getElementById('nextRoundBtn');
+  if (!btn) return;
+  if (!currentGame) { btn.disabled = true; btn.title = 'No game active'; return; }
+  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  btn.disabled = !isHost;
+  btn.title = isHost ? 'Start next round' : 'Waiting for host to continue.';
+}
+
+// Host-only: reset game state for a fresh new game without reloading page
+async function hostResetGame() {
+  if (!currentGame) return alert('No game to reset');
+  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+  if (!currentUser || currentUser.id !== hostCandidate) return alert('Only the host can reset the game.');
+  try {
+    // Delete all answers for this game
+    const answers = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.ANSWERS, [Appwrite.Query.equal('gameId', currentGame.$id)]);
+    for (const a of answers.documents) {
+      try { await database.deleteDocument(config.DATABASE_ID, config.COLLECTIONS.ANSWERS, a.$id); } catch (e) {}
+    }
+    // Optionally clear prompts submitted flag
+    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { status: 'waiting', submittedPrompts: [], currentPrompt: null });
+    // Reset local state
+    currentAnswers = [];
+    round = 1;
+    // Notify user
+  alert('Game reset by host. Players can submit new prompts.');
+  broadcastSystemMessage('Host has reset the game. Submit your prompts to start a new game.');
+  } catch (err) {
+    console.error('hostResetGame failed', err);
+    alert('Failed to reset game. See console for details.');
+  }
 }
 
 // --- Next Round ---
 async function nextRound() {
+  // Only host may advance to the next round
+  const hostCandidate = currentGame && (currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]));
+  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  if (!isHost) {
+    console.log('nextRound blocked: not host', { currentUserId: currentUser?.id, hostId: hostCandidate });
+    return alert('Only the host can start the next round.');
+  }
+
   round++;
   isVotingPhase = false;  // Reset voting phase flag
   hasVoted = false;  // Reset vote tracking
@@ -865,6 +998,8 @@ async function nextRound() {
     // Update game with new prompt
     await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, 
       { currentPrompt });
+  // announce to players which prompt was chosen
+  broadcastSystemMessage('Host started round ' + round + '. Get ready!');
   } catch (err) {
     console.error('Failed to get next round prompt:', err);
     alert('Failed to start next round. Please try again.');
@@ -901,16 +1036,20 @@ function showFinalResults() {
   
   if (nextRoundBtn) {
     nextRoundBtn.innerText = 'New Game';
-    nextRoundBtn.onclick = () => {
-      // Reset game state and go back to lobby
-      cleanupSubscriptions();
-      currentGame = null;
-      currentAnswers = [];
-      round = 1;
-      isVotingPhase = false;
-      hasVoted = false;
-      window.location.reload();
+    nextRoundBtn.onclick = async () => {
+      const hostCandidate = currentGame && (currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]));
+      const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+      if (round >= config.GAME_SETTINGS.ROUNDS_PER_GAME) {
+        if (!isHost) return alert('Waiting for the host to start a new game.');
+        // Host chooses to reset the game without a full reload
+        await hostResetGame();
+        return;
+      }
+      // Not final -> try to advance (nextRound enforces host)
+      nextRound();
     };
+    // Ensure button state reflects host permissions
+    updateNextRoundButtonState();
   }
 }
 
@@ -918,7 +1057,9 @@ function showFinalResults() {
 function subscribeVotes() {
   // Subscribe to vote updates on answers for current game
   const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
-    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
+  // record heartbeat
+  recordRealtimeEvent();
+  if (response.events.includes('databases.*.collections.*.documents.*.update')) {
       const doc = response.payload;
       // Check if this is an answer document for our game
       if (doc.gameId === currentGame.$id && doc.votes !== undefined) {
@@ -927,14 +1068,42 @@ function subscribeVotes() {
         voteButtons.forEach(btn => {
           // Update button text if it matches this answer
           if (btn.dataset && btn.dataset.answerId === doc.$id) {
-            const voteCount = doc.votes > 0 ? ` (${doc.votes} votes)` : '';
-            btn.innerText = doc.promptText + voteCount;
+            if (votingEnded) {
+              const voteCount = doc.votes > 0 ? ` (${doc.votes} votes)` : '';
+              btn.innerText = doc.promptText + voteCount;
+            } else {
+              btn.innerText = doc.promptText;
+            }
           }
         });
+        // Recompute total recorded votes for the game and show leaderboard only when everyone has voted
+        (async () => {
+          try {
+            if (votingEnded) return;
+            const answers = await database.listDocuments(config.DATABASE_ID, config.COLLECTIONS.ANSWERS, [Appwrite.Query.equal('gameId', currentGame.$id)]);
+            let totalVotes = 0;
+            answers.documents.forEach(a => { totalVotes += (a.votes || 0); });
+            const playerCount = currentGame.players ? currentGame.players.length : 0;
+            console.log('subscribeVotes: totalVotes', totalVotes, 'playerCount', playerCount);
+            if (playerCount > 0 && totalVotes >= playerCount) {
+              votingEnded = true;
+              // stop voting timer
+              if (votingTimerInterval) { clearInterval(votingTimerInterval); votingTimerInterval = null; }
+              // hide voting UI and show leaderboard
+              try {
+                document.getElementById('voting').style.display = 'none';
+              } catch (e) {}
+              showLeaderboard();
+            }
+          } catch (e) {
+            console.error('Error computing totalVotes', e);
+          }
+        })();
       }
     }
   });
   voteSubscription = subscription;
+  startRealtimeMonitor();
 }
 
 // --- Cleanup Subscriptions ---
@@ -950,6 +1119,8 @@ function cleanupSubscriptions() {
   });
   activeSubscriptions = [];
   cleanupAnswerSubscriptions();
+  // Stop realtime monitor when all subscriptions cleaned
+  stopRealtimeMonitor();
 }
 
 // --- Cleanup Answer/Vote Subscriptions ---
@@ -969,6 +1140,10 @@ function cleanupAnswerSubscriptions() {
       console.error('Error cleaning up vote subscription:', err);
     }
     voteSubscription = null;
+  }
+  // Stop realtime monitor if no active subscriptions
+  if (!activeSubscriptions.length && !answerSubscription && !voteSubscription) {
+    stopRealtimeMonitor();
   }
 }
 
