@@ -29,6 +29,8 @@ const CONFIG = {
 };
 
 // Export for use in app.js
+window.CONFIG = CONFIG;
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = CONFIG;
 }

@@ -34,6 +34,8 @@ let currentPrompt = null;
 let currentAnswers = [];
 let round = 1;
 let activeSubscriptions = [];  // Track all active subscriptions for cleanup
+let answerSubscription = null;  // Track answer subscription separately for cleanup
+let voteSubscription = null;  // Track vote subscription separately for cleanup  
 let hasVoted = false;  // Track if current user has voted this round
 let isVotingPhase = false;  // Prevent race conditions in voting phase
 
@@ -315,6 +317,32 @@ function subscribeLobby() {
   cleanupSubscriptions();
   
   const playerList = document.getElementById('playerList');
+  
+  // Initialize button state based on whether current user is host
+  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  const startButton = document.getElementById('startGame');
+  
+  // Set initial button state
+  if (startButton) {
+    const submitted = currentGame.submittedPrompts || [];
+    const allPromptsSubmitted = submitted.length === currentGame.players.length;
+    
+    if (allPromptsSubmitted) {
+      startButton.disabled = !isHost;
+      startButton.innerText = isHost ? "Start Game" : "Waiting for host...";
+    } else {
+      startButton.disabled = true;
+      startButton.innerText = "Waiting for prompts...";
+    }
+    
+    console.log('subscribeLobby: initial button state', {
+      isHost,
+      allPromptsSubmitted,
+      disabled: startButton.disabled,
+      text: startButton.innerText
+    });
+  }
   // Ensure a debug button exists in lobby for quick inspection
   if (config.SHOW_DEBUG_BUTTON || config.DEBUG_MODE) {
     const lobbyEl = document.getElementById('lobby');
@@ -332,8 +360,8 @@ function subscribeLobby() {
     }
   }
 
-  const subscription = client.subscribe(`databases.jestblank_db.documents.${currentGame.$id}`, response => {
-    if (response.events.includes('database.documents.update')) {
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.GAMES}.documents.${currentGame.$id}`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
       currentGame = response.payload;
       // Update host label
       const hostId = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
@@ -360,13 +388,24 @@ function subscribeLobby() {
         showPrompt();
       } else if (currentGame.submittedPrompts && currentGame.submittedPrompts.length === currentGame.players.length) {
         // Enable start button only for host when all prompts are submitted
-  const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
-  const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
-        console.log('subscribeLobby: all prompts submitted', { submittedCount: currentGame.submittedPrompts.length, playersCount: currentGame.players.length, isHost });
+        const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
+        const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+        console.log('subscribeLobby: all prompts submitted', { 
+          submittedCount: currentGame.submittedPrompts.length, 
+          playersCount: currentGame.players.length, 
+          isHost,
+          currentUserId: currentUser?.id,
+          hostId: hostCandidate
+        });
         document.getElementById('startGame').disabled = !isHost;
         document.getElementById('startGame').innerText = isHost ? "Start Game" : "Waiting for host...";
       } else {
-        console.log('subscribeLobby: waiting for prompts', { submitted: currentGame.submittedPrompts, players: currentGame.players });
+        console.log('subscribeLobby: waiting for prompts', { 
+          submitted: currentGame.submittedPrompts?.length || 0, 
+          players: currentGame.players?.length || 0,
+          submittedList: currentGame.submittedPrompts,
+          playersList: currentGame.players
+        });
         document.getElementById('startGame').disabled = true;
         document.getElementById('startGame').innerText = "Waiting for prompts...";
       }
@@ -413,15 +452,25 @@ async function addPrompt() {
   let submitted = currentGame.submittedPrompts || [];
   if (!submitted.includes(currentUser.id)) {
     submitted.push(currentUser.id);
-  await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { submittedPrompts: submitted });
-  // Update local cache so UI immediately reflects submission
-  currentGame.submittedPrompts = submitted;
+    await safeUpdateDocument(config.DATABASE_ID, config.COLLECTIONS.GAMES, currentGame.$id, { submittedPrompts: submitted });
+    // Update local cache so UI immediately reflects submission
+    currentGame.submittedPrompts = submitted;
+    console.log('addPrompt: updated submittedPrompts', { 
+      submittedPrompts: submitted,
+      playersCount: currentGame.players?.length || 0,
+      allPromptsSubmitted: submitted.length === currentGame.players?.length
+    });
   }
 }
 
 // --- Start Game ---
 async function startGame() {
-  console.log('startGame invoked', { currentUser, currentGame });
+  console.log('startGame invoked', { 
+    currentUser, 
+    currentGame,
+    buttonDisabled: document.getElementById('startGame').disabled,
+    buttonText: document.getElementById('startGame').innerText
+  });
   
   // Input validation
   if (!currentGame) {
@@ -446,8 +495,14 @@ async function startGame() {
   // Only host can start the game
   const hostCandidate = currentGame.hostId || (currentGame.players && currentGame.players[0] && currentGame.players[0].split(":")[0]);
   const isHost = currentUser && hostCandidate && currentUser.id === hostCandidate;
+  console.log('startGame: checking host status', {
+    isHost,
+    currentUserId: currentUser?.id,
+    hostId: hostCandidate,
+    players: currentGame.players
+  });
   if (!isHost) {
-    console.log('startGame blocked: not host', { isHost, currentUser, currentGame });
+    console.log('startGame blocked: not host');
     return alert("Only the host can start the game.");
   }
   
@@ -512,6 +567,27 @@ function showPrompt() {
   if (!promptDiv || !promptText || !answerInput) {
     console.error('Required prompt elements not found');
     return;
+  }
+  
+  // Reset state for new round
+  currentAnswers = [];
+  isVotingPhase = false;
+  hasVoted = false;
+  
+  // Hide voting div if still visible
+  const votingDiv = document.getElementById('voting');
+  if (votingDiv) {
+    votingDiv.style.display = 'none';
+  }
+  
+  // Clear any existing timers
+  if (promptTimerInterval) {
+    clearInterval(promptTimerInterval);
+    promptTimerInterval = null;
+  }
+  if (votingTimerInterval) {
+    clearInterval(votingTimerInterval);
+    votingTimerInterval = null;
   }
   
   promptDiv.classList.remove('fade-out');
@@ -595,9 +671,12 @@ async function submitAnswer() {
 
 // --- Answers Subscription ---
 function subscribeAnswers() {
+  // Clean up any existing answer subscriptions first
+  cleanupAnswerSubscriptions();
+  
   currentAnswers = [];
-  const subscription = client.subscribe(`databases.jestblank_db.documents`, response => {
-    if (response.events.includes('database.documents.create')) {
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.create')) {
       const doc = response.payload;
       if (doc.gameId === currentGame.$id) currentAnswers.push(doc);
       // Only start voting when all answers are submitted and not already in voting phase
@@ -607,7 +686,7 @@ function subscribeAnswers() {
       }
     }
   });
-  activeSubscriptions.push(subscription);
+  answerSubscription = subscription;
 }
 
 // --- Start Voting ---
@@ -621,12 +700,23 @@ function startVoting() {
   startVotingTimer(config.GAME_SETTINGS.VOTING_TIMER_SECONDS);
   const container = document.getElementById('voteOptions');
   container.innerHTML = '';
-  const allAnswers = [...currentAnswers];
-  allAnswers.push({
-    playerId: currentUser.id,
-    promptText: document.getElementById('answerInput').value,
-    $id: 'self'
-  });
+  
+  // Filter out current user's answer if already in the list to prevent duplicates
+  const filteredAnswers = currentAnswers.filter(a => a.playerId !== currentUser.id);
+  const allAnswers = [...filteredAnswers];
+  
+  // Add current user's answer (either from input or from subscription)
+  const userAnswer = currentAnswers.find(a => a.playerId === currentUser.id);
+  if (userAnswer) {
+    allAnswers.push(userAnswer);
+  } else {
+    allAnswers.push({
+      playerId: currentUser.id,
+      promptText: document.getElementById('answerInput').value || '(No answer)',
+      $id: 'self'
+    });
+  }
+  
   const shuffled = allAnswers.sort(() => Math.random() - 0.5);
   for (let i = 0; i < shuffled.length; i += 2) {
     const a = shuffled[i];
@@ -785,7 +875,16 @@ async function nextRound() {
     leaderboardDiv.classList.add('fade-out');
     setTimeout(() => {
       leaderboardDiv.style.display = 'none';
-      showPrompt();
+      // Ensure prompt div is hidden before showing new prompt
+      const promptDiv = document.getElementById('prompt');
+      if (promptDiv) {
+        promptDiv.style.display = 'none';
+        promptDiv.classList.remove('fade-in', 'fade-out');
+      }
+      // Small delay to ensure clean transition
+      setTimeout(() => {
+        showPrompt();
+      }, 100);
     }, 300);
   }
 }
@@ -818,8 +917,8 @@ function showFinalResults() {
 // --- Subscribe to Votes ---
 function subscribeVotes() {
   // Subscribe to vote updates on answers for current game
-  const subscription = client.subscribe(`databases.jestblank_db.documents`, response => {
-    if (response.events.includes('databases.documents.update')) {
+  const subscription = client.subscribe([`databases.${config.DATABASE_ID}.collections.${config.COLLECTIONS.ANSWERS}.documents`], response => {
+    if (response.events.includes('databases.*.collections.*.documents.*.update')) {
       const doc = response.payload;
       // Check if this is an answer document for our game
       if (doc.gameId === currentGame.$id && doc.votes !== undefined) {
@@ -835,7 +934,7 @@ function subscribeVotes() {
       }
     }
   });
-  activeSubscriptions.push(subscription);
+  voteSubscription = subscription;
 }
 
 // --- Cleanup Subscriptions ---
@@ -850,6 +949,27 @@ function cleanupSubscriptions() {
     }
   });
   activeSubscriptions = [];
+  cleanupAnswerSubscriptions();
+}
+
+// --- Cleanup Answer/Vote Subscriptions ---
+function cleanupAnswerSubscriptions() {
+  if (answerSubscription && typeof answerSubscription === 'function') {
+    try {
+      answerSubscription();
+    } catch (err) {
+      console.error('Error cleaning up answer subscription:', err);
+    }
+    answerSubscription = null;
+  }
+  if (voteSubscription && typeof voteSubscription === 'function') {
+    try {
+      voteSubscription();
+    } catch (err) {
+      console.error('Error cleaning up vote subscription:', err);
+    }
+    voteSubscription = null;
+  }
 }
 
 // --- Event Listeners ---
@@ -868,7 +988,15 @@ document.getElementById('showRegister').addEventListener('click', function(e) {
 document.getElementById('createGame').addEventListener('click', createGame);
 document.getElementById('joinGame').addEventListener('click', joinGame);
 document.getElementById('addPrompt').addEventListener('click', addPrompt);
-document.getElementById('startGame').addEventListener('click', startGame);
+document.getElementById('startGame').addEventListener('click', function(e) {
+  console.log('Start Game button clicked', {
+    disabled: e.target.disabled,
+    text: e.target.innerText
+  });
+  if (!e.target.disabled) {
+    startGame();
+  }
+});
 document.getElementById('submitAnswer').addEventListener('click', submitAnswer);
 document.getElementById('nextRoundBtn').addEventListener('click', nextRound);
 
