@@ -1,23 +1,88 @@
+/* Fade-in and fade-out for smoother transitions */
+.fade-in {
+  animation: fadeIn 0.3s ease-in forwards;
+  opacity: 0;
+}
+.fade-out {
+  animation: fadeOut 0.3s ease-out forwards;
+  opacity: 1;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
 body {
-  font-family: Arial, sans-serif;
+  font-family: 'Segoe UI', Arial, sans-serif;
   text-align: center;
-  background: #f2f2f2;
+  background: linear-gradient(120deg, #e0eafc 0%, #cfdef3 100%);
   margin: 0;
   padding: 2rem;
+  min-height: 100vh;
+}
+/* Card container for sections */
+.card {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  margin: 2rem auto;
+  padding: 2rem 1.5rem;
+  max-width: 400px;
+  width: 100%;
 }
 
 input, button {
-  padding: 0.5rem;
+  padding: 0.75rem;
   margin: 0.5rem;
+  font-size: 1rem;
+  border-radius: 6px;
+  border: 1px solid #ccc;
 }
 
 button {
   cursor: pointer;
+  background: #4caf50;
+  color: #fff;
+  border: none;
+  font-weight: bold;
+  box-shadow: 0 2px 8px rgba(76,175,80,0.08);
+  transition: background 0.2s, transform 0.2s;
+}
+button:hover {
+  background: #388e3c;
 }
 
 #playerList, #promptList, #scoreList {
   list-style: none;
   padding: 0;
+  background: #f9f9f9;
+  border-radius: 8px;
+  margin: 1rem auto;
+  max-width: 350px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+}
+#playerList li, #promptList li, #scoreList li {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #eee;
+  font-size: 1.1rem;
+}
+#playerList li:last-child, #promptList li:last-child, #scoreList li:last-child {
+  border-bottom: none;
+}
+#globalPrompt.card {
+  background: linear-gradient(120deg, #fffbe6 60%, #e3fcec 100%);
+  border: 2px solid #ffe082;
+  box-shadow: 0 4px 16px rgba(255,193,7,0.12);
+  margin-top: 2.5rem;
+  margin-bottom: 2.5rem;
+  padding: 2rem 1.5rem;
+  max-width: 420px;
+  width: 100%;
+  position: relative;
+  z-index: 2;
 }
 
 /* Animations */
