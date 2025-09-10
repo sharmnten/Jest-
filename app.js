@@ -4,7 +4,7 @@
 const config = window.CONFIG || {
   APPWRITE_ENDPOINT: 'https://nyc.cloud.appwrite.io/v1',
   APPWRITE_PROJECT_ID: 'jest',
-  DATABASE_ID: config.DATABASE_ID,
+  DATABASE_ID: 'jestblank_db',
   COLLECTIONS: {
     GAMES: 'games',
     PROMPTS: 'prompts',
